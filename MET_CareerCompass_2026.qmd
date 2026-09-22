@@ -1,0 +1,558 @@
+---
+title: 'MET CareerCompass 2026: Load Data into Spark SQL'
+jupyter: python3
+---
+
+
+
+```{python}
+!gdown --folder "https://drive.google.com/drive/folders/1wf3kZeUWO_0fnZJqcXZN-53l8MILX0a_?usp=sharing" -O ../data/MET_CareerCompass_2026
+```
+
+```{python}
+import os
+import sys
+from pathlib import Path
+
+print("[1/6] Importing PySpark...", flush=True)
+from pyspark.sql import SparkSession
+
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
+print("[2/6] Starting Spark session...", flush=True)
+spark = (
+    SparkSession.builder
+    .appName("JobPostingsAnalysis")
+    .master("local[*]")
+    .config("spark.driver.host", "localhost")
+    .getOrCreate()
+)
+print("[3/6] Spark session ready.", flush=True)
+
+spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "false")
+
+# Use the full dataset for the final analysis.
+USE_SAMPLE = False
+
+candidate_dirs = [
+    Path("../data/MET_CareerCompass_2026"),
+    Path("data/MET_CareerCompass_2026"),
+    Path(r"E:\Data\Jobs\_2026\_Refined"),
+]
+data_dir = next((path.resolve() for path in candidate_dirs if path.exists()), None)
+if data_dir is None:
+    raise FileNotFoundError(
+        "Dataset directory not found. Checked: "
+        + ", ".join(str(path.resolve()) for path in candidate_dirs)
+    )
+
+print(f"[4/6] Looking for Parquet files in {data_dir}...", flush=True)
+parquet_files = sorted(data_dir.glob("*.parquet"))
+if not parquet_files:
+    raise FileNotFoundError(f"No Parquet files found in {data_dir}")
+
+if USE_SAMPLE:
+    parquet_files = parquet_files[:1]
+print(f"[5/6] Reading {len(parquet_files)} Parquet file(s)...", flush=True)
+df = spark.read.parquet(*[str(path) for path in parquet_files])
+
+# Parquet columns are uppercase; normalize once so the rest of the notebook can use lowercase names.
+df = df.toDF(*[column.lower() for column in df.columns])
+df.createOrReplaceTempView("job_postings")
+
+print("[6/6] Data loaded and registered as job_postings.", flush=True)
+df.printSchema()
+df.show(5)
+```
+
+```{python}
+from pyspark.sql.functions import col, monotonically_increasing_id
+
+
+companies = (
+    df.select(
+        col("company_name").alias("company"),
+        "company_name",
+        "company_raw",
+        "company_is_staffing",
+    )
+    .distinct()
+    .withColumn("company_id", monotonically_increasing_id())
+    .select(
+        "company_id",
+        "company",
+        "company_name",
+        "company_raw",
+        "company_is_staffing",
+    )
+)
+
+industries = (
+    df.select(
+        "naics_2022_6",
+        "naics_2022_6_name",
+        "soc_5",
+        "soc_5_name",
+        "onet_name",
+        "soc_2_name",
+    )
+    .distinct()
+    .withColumn("industry_id", monotonically_increasing_id())
+    .select(
+        "industry_id",
+        "naics_2022_6",
+        "naics_2022_6_name",
+        "soc_5",
+        "soc_5_name",
+        "onet_name",
+        "soc_2_name",
+    )
+)
+
+locations = (
+    df.select(
+        "location",
+        "city_name",
+        "state_name",
+        "county_name",
+        "msa",
+        "msa_name",
+    )
+    .distinct()
+    .withColumn("location_id", monotonically_increasing_id())
+    .select(
+        "location_id",
+        "location",
+        "city_name",
+        "state_name",
+        "county_name",
+        "msa",
+        "msa_name",
+    )
+)
+
+print(flush=True)
+job_postings = (
+    df.alias("j")
+    .join(
+        companies.alias("c"),
+        col("j.company_name").eqNullSafe(col("c.company_name"))
+        & col("j.company_raw").eqNullSafe(col("c.company_raw"))
+        & col("j.company_is_staffing").eqNullSafe(col("c.company_is_staffing")),
+        "left",
+    )
+    .join(
+        industries.alias("i"),
+        col("j.naics_2022_6").eqNullSafe(col("i.naics_2022_6"))
+        & col("j.naics_2022_6_name").eqNullSafe(col("i.naics_2022_6_name"))
+        & col("j.soc_5").eqNullSafe(col("i.soc_5"))
+        & col("j.soc_5_name").eqNullSafe(col("i.soc_5_name"))
+        & col("j.onet_name").eqNullSafe(col("i.onet_name"))
+        & col("j.soc_2_name").eqNullSafe(col("i.soc_2_name")),
+        "left",
+    )
+    .join(
+        locations.alias("l"),
+        col("j.location").eqNullSafe(col("l.location"))
+        & col("j.city_name").eqNullSafe(col("l.city_name"))
+        & col("j.state_name").eqNullSafe(col("l.state_name"))
+        & col("j.county_name").eqNullSafe(col("l.county_name"))
+        & col("j.msa").eqNullSafe(col("l.msa"))
+        & col("j.msa_name").eqNullSafe(col("l.msa_name")),
+        "left",
+    )
+    .select(
+        col("j.id").alias("id"),
+        col("j.title_clean"),
+        col("c.company_id"),
+        col("i.industry_id"),
+        col("j.employment_type_name"),
+        col("j.remote_type_name"),
+        col("j.body"),
+        col("j.min_years_experience"),
+        col("j.max_years_experience"),
+        col("j.salary"),
+        col("j.salary_from"),
+        col("j.salary_to"),
+        col("l.location_id"),
+        col("j.posted"),
+        col("j.expired"),
+        col("j.duration"),
+    )
+)
+
+# Register all four relational tables for Spark SQL queries.
+companies.createOrReplaceTempView("companies")
+industries.createOrReplaceTempView("industries")
+locations.createOrReplaceTempView("locations")
+job_postings.createOrReplaceTempView("job_postings")
+job_postings.createOrReplaceTempView("met_career_compass_records")
+
+print(flush=True)
+for table_name, table_df in {
+    "job_postings": job_postings,
+    "companies": companies,
+    "industries": industries,
+    "locations": locations,
+}.items():
+    print(f"- {table_name}: {table_df.count():,} rows", flush=True)
+
+companies.show(5, truncate=False)
+industries.show(5, truncate=False)
+locations.show(5, truncate=False)
+job_postings.show(5, truncate=False)
+```
+
+```{python}
+# Use the industry dimension already linked to job_postings so foreign keys remain consistent.
+industries_df = industries.select(
+    "industry_id",
+    "naics_2022_6",
+    "naics_2022_6_name",
+    col("soc_5").alias("soc_code"),
+    col("soc_5_name").alias("soc_name"),
+    col("onet_name").alias("specialized_occupation"),
+    col("soc_2_name").alias("occupation_group"),
+)
+
+industries_df.createOrReplaceTempView("industries")
+industries_df.show(5, truncate=False)
+```
+
+```{python}
+#Create separate relational DataFrames for each table.
+
+job_postings_df = job_postings.select(
+    "id",
+    "title_clean",
+    "company_id",
+    "industry_id",
+    "employment_type_name",
+    "remote_type_name",
+    "body",
+    "min_years_experience",
+    "max_years_experience",
+    "salary",
+    "salary_from",
+    "salary_to",
+    "location_id",
+    "posted",
+    "expired",
+    "duration",
+)
+
+companies_df = companies.select(
+    "company_id",
+    "company",
+    "company_name",
+    "company_raw",
+    "company_is_staffing",
+)
+
+locations_df = locations.select(
+    "location_id",
+    "location",
+    "city_name",
+    "state_name",
+    "county_name",
+    "msa",
+    "msa_name",
+)
+
+# Register each table separately for Spark SQL queries.
+job_postings_df.createOrReplaceTempView("job_postings")
+companies_df.createOrReplaceTempView("companies")
+industries_df.createOrReplaceTempView("industries")
+locations_df.createOrReplaceTempView("locations")
+
+print("job_postings table:")
+job_postings_df.printSchema()
+job_postings_df.show(5, truncate=False)
+
+print("companies table:")
+companies_df.printSchema()
+companies_df.show(5, truncate=False)
+
+print("industries table:")
+industries_df.printSchema()
+industries_df.show(5, truncate=False)
+
+print("locations table:")
+locations_df.printSchema()
+locations_df.show(5, truncate=False)
+```
+
+```{python}
+import plotly.express as px
+from IPython.display import HTML, display
+from pathlib import Path
+
+salary_trends = spark.sql("""
+    WITH salary_data AS (
+        SELECT
+            i.naics_2022_6_name AS industry_name,
+            i.specialized_occupation,
+            COALESCE(
+                try_cast(regexp_replace(j.salary_from, '[^0-9.]', '') AS DOUBLE),
+                try_cast(regexp_replace(j.salary_to, '[^0-9.]', '') AS DOUBLE)
+            ) AS salary_value
+        FROM job_postings AS j
+        INNER JOIN industries AS i
+            ON j.industry_id = i.industry_id
+        WHERE i.naics_2022_6 = '518210'
+    )
+    SELECT
+        industry_name,
+        specialized_occupation,
+        percentile_approx(salary_value, 0.5) AS median_salary,
+        COUNT(*) AS posting_count
+    FROM salary_data
+    WHERE salary_value IS NOT NULL
+      AND salary_value > 0
+      AND specialized_occupation IS NOT NULL
+    GROUP BY industry_name, specialized_occupation
+    ORDER BY median_salary DESC
+    LIMIT 20
+""")
+
+print("Top 20 median salary trends:")
+salary_trends.show(20, truncate=False)
+
+salary_trends_pd = salary_trends.toPandas()
+fig = px.bar(
+    salary_trends_pd,
+    x="median_salary",
+    y="specialized_occupation",
+    orientation="h",
+    hover_data=["posting_count"],
+    text="median_salary",
+    title="Top 20 Median Salaries in Technology Industry",
+    labels={
+        "median_salary": "Median Salary",
+        "specialized_occupation": "Specialized Occupation",
+        "posting_count": "Job Postings",
+    },
+)
+fig.update_traces(
+    marker_color="#2f6f8f",
+    texttemplate="$%{text:,.0f}",
+    textposition="inside",
+    insidetextanchor="middle",
+    textfont={"size": 10, "color": "white"},
+)
+fig.update_layout(
+    autosize=True,
+    height=760,
+    bargap=0.18,
+    margin={"l": 285, "r": 35, "t": 65, "b": 55},
+    font={"size": 11},
+    xaxis={"tickprefix": "$", "tickformat": ",.0f", "automargin": True},
+    yaxis={"categoryorder": "total ascending", "automargin": True},
+)
+
+output_dir = Path("output")
+output_dir.mkdir(exist_ok=True)
+chart_path = output_dir / "technology_median_salary_trends.html"
+fig.write_html(chart_path, auto_open=False, include_plotlyjs="cdn")
+print(f"Interactive Plotly chart saved to {chart_path}")
+display(HTML(fig.to_html(include_plotlyjs="cdn", full_html=False, config={"responsive": True})))
+```
+
+```{python}
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+remote_ca = spark.sql("""
+    SELECT
+        c.company_name,
+        COUNT(*) AS remote_jobs
+    FROM job_postings AS j
+    INNER JOIN companies AS c
+        ON j.company_id = c.company_id
+    INNER JOIN locations AS l
+        ON j.location_id = l.location_id
+    WHERE j.remote_type_name = 'Remote'
+      AND l.state_name = 'California'
+    GROUP BY c.company_name
+    ORDER BY remote_jobs DESC
+""")
+
+top_remote_ca = remote_ca.limit(5)
+print("Top companies hiring for remote jobs in CA:")
+top_remote_ca.show(truncate=False)
+
+top_remote_ca_pd = top_remote_ca.toPandas()
+sns.set_theme(style="whitegrid")
+plt.figure(figsize=(10, 6))
+sns.barplot(
+    data=top_remote_ca_pd,
+    x="company_name",
+    y="remote_jobs",
+    hue="company_name",
+    palette="deep",
+    legend=False,
+)
+plt.title("Top Companies Hiring for Remote Jobs in CA")
+plt.xlabel("Company Name")
+plt.ylabel("Remote Jobs")
+plt.xticks(rotation=45, ha="right")
+plt.tight_layout()
+
+output_dir = Path("output")
+output_dir.mkdir(exist_ok=True)
+remote_chart_path = output_dir / "top_remote_companies_ca.png"
+plt.savefig(remote_chart_path, dpi=150, bbox_inches="tight")
+plt.show()
+print(f"Seaborn chart saved to {remote_chart_path}")
+```
+
+```{python}
+from pyspark.sql.functions import to_date
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+monthly_ca = spark.sql("""
+    WITH dated_records AS (
+        SELECT
+            to_date(j.posted, 'yyyy-MM-dd') AS posted_date
+        FROM job_postings AS j
+        INNER JOIN locations AS l
+            ON j.location_id = l.location_id
+        WHERE l.state_name = 'California'
+    )
+    SELECT
+        year(posted_date) AS year,
+        month(posted_date) AS month,
+        COUNT(*) AS job_count
+    FROM dated_records
+    WHERE posted_date IS NOT NULL
+    GROUP BY year(posted_date), month(posted_date)
+    ORDER BY year DESC, month DESC
+""")
+
+print("Monthly California record trends:")
+monthly_ca.show(50, truncate=False)
+
+monthly_ca_pd = monthly_ca.toPandas().sort_values(["year", "month"])
+sns.set_theme(style="whitegrid")
+plt.figure(figsize=(11, 6))
+sns.lineplot(
+    data=monthly_ca_pd,
+    x="month",
+    y="job_count",
+    hue="year",
+    marker="o",
+    palette="deep",
+)
+plt.xticks(
+    range(1, 13),
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+)
+plt.title("Monthly Met Career Compass Records in CA")
+plt.xlabel("Month")
+plt.ylabel("Job Count")
+plt.legend(title="Year")
+plt.tight_layout()
+
+output_dir = Path("output")
+output_dir.mkdir(exist_ok=True)
+monthly_chart_path = output_dir / "monthly_california_record_trends.png"
+plt.savefig(monthly_chart_path, dpi=150, bbox_inches="tight")
+plt.show()
+print(f"Seaborn chart saved to {monthly_chart_path}")
+```
+
+```{python}
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+metro_salary = spark.sql("""
+    WITH metro_map(metro_area, search_term) AS (
+        VALUES
+            ('Boston', 'boston'),
+            ('Washington DC', 'washington'),
+            ('New York', 'new york'),
+            ('San Francisco', 'san francisco'),
+            ('Seattle', 'seattle'),
+            ('Los Angeles', 'los angeles'),
+            ('Dallas', 'dallas'),
+            ('Houston', 'houston'),
+            ('Austin', 'austin'),
+            ('Nashville', 'nashville'),
+            ('Kansas City', 'kansas city'),
+            ('Denver', 'denver')
+    ),
+    metro_records AS (
+        SELECT
+            m.metro_area,
+            COALESCE(
+                try_cast(regexp_replace(j.salary_from, '[^0-9.]', '') AS DOUBLE),
+                try_cast(regexp_replace(j.salary_to, '[^0-9.]', '') AS DOUBLE)
+            ) AS salary_value
+        FROM job_postings AS j
+        INNER JOIN locations AS l
+            ON j.location_id = l.location_id
+        INNER JOIN metro_map AS m
+            ON lower(concat_ws(
+                ' ',
+                coalesce(l.location, ''),
+                coalesce(l.city_name, ''),
+                coalesce(l.msa_name, '')
+            )) LIKE concat('%', m.search_term, '%')
+    ),
+    metro_summary AS (
+        SELECT
+            metro_area,
+            ROUND(AVG(salary_value), 2) AS average_salary,
+            COUNT(*) AS record_count
+        FROM metro_records
+        WHERE salary_value IS NOT NULL
+          AND salary_value > 0
+        GROUP BY metro_area
+    )
+    SELECT
+        m.metro_area,
+        COALESCE(s.average_salary, 0) AS average_salary,
+        COALESCE(s.record_count, 0) AS record_count
+    FROM metro_map AS m
+    LEFT JOIN metro_summary AS s
+        ON m.metro_area = s.metro_area
+    ORDER BY average_salary DESC
+""")
+
+print("Average salaries across selected major US metros:")
+metro_salary.show(truncate=False)
+
+metro_salary_pd = metro_salary.toPandas()
+sns.set_theme(style="whitegrid")
+plt.figure(figsize=(14, 7))
+sns.barplot(
+    data=metro_salary_pd,
+    x="metro_area",
+    y="average_salary",
+    hue="metro_area",
+    palette="deep",
+    legend=False,
+)
+plt.title("Average Salary Across Selected Major US Metro Areas")
+plt.xlabel("Metropolitan Area")
+plt.ylabel("Average Salary")
+plt.xticks(rotation=45, ha="right")
+plt.gca().yaxis.set_major_formatter(
+    plt.matplotlib.ticker.StrMethodFormatter("${x:,.0f}")
+)
+plt.tight_layout()
+
+output_dir = Path("output")
+output_dir.mkdir(exist_ok=True)
+metro_chart_path = output_dir / "average_salary_major_metros.png"
+plt.savefig(metro_chart_path, dpi=150, bbox_inches="tight")
+plt.show()
+print(f"Seaborn chart saved to {metro_chart_path}")
+```
+
+```{python}
+!quarto convert MET_CareerCompass_2026.ipynb
+```
+
